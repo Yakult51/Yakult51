@@ -1,0 +1,825 @@
+name: Build MotionFX APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+- name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+- name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+- name: Generate full MotionFX project
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/aryan/motionfx/core
+          mkdir -p app/src/main/java/com/aryan/motionfx/ui
+
+cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MotionFX"
+          include(":app")
+          EOF
+
+cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF
+
+cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+android {
+              namespace = "com.aryan.motionfx"
+              compileSdk = 34
+
+defaultConfig {
+                  applicationId = "com.aryan.motionfx"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.2.0"
+              }
+
+buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+          }
+          EOF
+
+cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="MotionFX"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/core/Bezier.kt <<'EOF'
+          package com.aryan.motionfx.core
+
+import kotlin.math.abs
+
+/** Chromium-style cubic-bezier timing solver (Newton + bisection fallback). */
+          object BezierSolver {
+
+fun solve(p: Float, x1: Float, y1: Float, x2: Float, y2: Float): Float {
+                  if (p <= 0f) return 0f
+                  if (p >= 1f) return 1f
+                  if (x1 == 0f && y1 == 0f && x2 == 1f && y2 == 1f) return p
+                  return bezierY(findT(p, x1, x2), y1, y2)
+              }
+
+private fun bezierY(t: Float, a: Float, b: Float): Float {
+                  val u = 1f - t
+                  return 3f * u * u * t * a + 3f * u * t * t * b + t * t * t
+              }
+
+private fun bezierX(t: Float, a: Float, b: Float): Float {
+                  val u = 1f - t
+                  return 3f * u * u * t * a + 3f * u * t * t * b + t * t * t
+              }
+
+private fun bezierDX(t: Float, x1: Float, x2: Float): Float {
+                  val u = 1f - t
+                  return 3f * u * u * x1 + 6f * u * t * (x2 - x1) + 3f * t * t * (1f - x2)
+              }
+
+private fun findT(x: Float, x1: Float, x2: Float): Float {
+                  var t = x
+                  for (i in 0..7) {
+                      val err = bezierX(t, x1, x2) - x
+                      if (abs(err) < 1e-6f) return t
+                      val d = bezierDX(t, x1, x2)
+                      if (abs(d) < 1e-6f) break
+                      t -= err / d
+                  }
+                  var lo = 0f; var hi = 1f; t = x
+                  for (i in 0..24) {
+                      val v = bezierX(t, x1, x2)
+                      if (abs(v - x) < 1e-5f) return t
+                      if (v < x) lo = t else hi = t
+                      t = (lo + hi) / 2f
+                  }
+                  return t
+              }
+          }
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/core/Model.kt <<'EOF'
+          package com.aryan.motionfx.core
+
+import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import kotlin.math.abs
+
+enum class Easing { LINEAR, EASE_IN, EASE_OUT, EASE_IN_OUT, CUSTOM }
+
+enum class AnimatableProperty { POSITION_X, POSITION_Y, SCALE, ROTATION, OPACITY }
+
+enum class LayerType { SOLID, TEXT, IMAGE }
+
+data class Keyframe(
+              val time: Float,
+              val value: Float,
+              val easing: Easing = Easing.LINEAR,
+              val x1: Float = when (easing) { Easing.LINEAR, Easing.EASE_OUT -> 0f; else -> 0.42f },
+              val y1: Float = 0f,
+              val x2: Float = when (easing) { Easing.LINEAR, Easing.EASE_IN -> 1f; else -> 0.58f },
+              val y2: Float = 1f
+          )
+
+data class Layer(
+              val id: Long,
+              val name: String,
+              val type: LayerType = LayerType.SOLID,
+              val color: Color = Color.White,
+              val text: String = "",
+              val fontSize: Float = 96f,
+              val imageId: String = "",
+              val startTime: Float = 0f,
+              val duration: Float = 5f,
+              val size: Size = Size(400f, 400f),
+              val visible: Boolean = true,
+              val baseValues: Map<AnimatableProperty, Float> = emptyMap(),
+              val keyframes: Map<AnimatableProperty, List<Keyframe>> = emptyMap()
+          )
+
+data class Composition(
+              val width: Int = 1920,
+              val height: Int = 1080,
+              val fps: Int = 30,
+              val duration: Float = 5f,
+              val backgroundColor: Color = Color.Black,
+              val layers: List<Layer> = emptyList()
+          )
+
+object ImageStore {
+              private val map = mutableMapOf<String, ImageBitmap>()
+              fun put(id: String, bitmap: ImageBitmap) { map[id] = bitmap }
+              operator fun get(id: String): ImageBitmap? = map[id]
+          }
+
+fun easingHandles(e: Easing): FloatArray = when (e) {
+              Easing.LINEAR      -> floatArrayOf(0f, 0f, 1f, 1f)
+              Easing.EASE_IN     -> floatArrayOf(0.42f, 0f, 1f, 1f)
+              Easing.EASE_OUT    -> floatArrayOf(0f, 0f, 0.58f, 1f)
+              Easing.EASE_IN_OUT -> floatArrayOf(0.42f, 0f, 0.58f, 1f)
+              Easing.CUSTOM      -> floatArrayOf(0.33f, 0f, 0.67f, 1f)
+          }
+
+fun propertyColor(p: AnimatableProperty): Color = when (p) {
+              AnimatableProperty.POSITION_X, AnimatableProperty.POSITION_Y -> Color(0xFF7C4DFF)
+              AnimatableProperty.SCALE -> Color(0xFF26A69A)
+              AnimatableProperty.ROTATION -> Color(0xFFFFB300)
+              AnimatableProperty.OPACITY -> Color(0xFFEC407A)
+          }
+
+object KeyframeEngine {
+
+fun value(layer: Layer, prop: AnimatableProperty, localTime: Float, fallback: Float): Float =
+                  evaluate(layer.keyframes[prop], localTime, layer.baseValues[prop] ?: fallback)
+
+fun evaluate(keyframes: List<Keyframe>?, t: Float, fallback: Float): Float {
+                  if (keyframes.isNullOrEmpty()) return fallback
+                  val sorted = keyframes.sortedBy { it.time }
+                  if (t <= sorted.first().time) return sorted.first().value
+                  if (t >= sorted.last().time) return sorted.last().value
+                  for (i in 0 until sorted.size - 1) {
+                      val a = sorted[i]
+                      val b = sorted[i + 1]
+                      if (t in a.time..b.time) {
+                          val span = (b.time - a.time).coerceAtLeast(1e-5f)
+                          val eased = BezierSolver.solve((t - a.time) / span, a.x1, a.y1, a.x2, a.y2)
+                          return a.value + (b.value - a.value) * eased
+                      }
+                  }
+                  return sorted.last().value
+              }
+          }
+
+private fun Composition.mapLayer(layerId: Long, f: (Layer) -> Layer): Composition =
+              copy(layers = layers.map { if (it.id == layerId) f(it) else it })
+
+fun Composition.addLayer(layer: Layer): Composition = copy(layers = layers + layer)
+
+fun Composition.toggleVisibility(layerId: Long): Composition =
+              mapLayer(layerId) { it.copy(visible = !it.visible) }
+
+fun Composition.addKeyframe(
+              layerId: Long, prop: AnimatableProperty, time: Float, value: Float,
+              easing: Easing = Easing.LINEAR
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = (layer.keyframes[prop].orEmpty() + Keyframe(time, value, easing)).sortedBy { it.time }
+              layer.copy(keyframes = layer.keyframes + (prop to list))
+          }
+
+fun Composition.updateKeyframe(
+              layerId: Long, prop: AnimatableProperty, index: Int, newTime: Float
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = layer.keyframes[prop].orEmpty().toMutableList()
+              if (index in list.indices) {
+                  list[index] = list[index].copy(time = newTime.coerceIn(0f, layer.duration))
+                  layer.copy(keyframes = layer.keyframes + (prop to list))
+              } else layer
+          }
+
+fun Composition.updateKeyframeValue(
+              layerId: Long, prop: AnimatableProperty, index: Int, newValue: Float
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = layer.keyframes[prop].orEmpty().toMutableList()
+              if (index in list.indices) {
+                  list[index] = list[index].copy(value = newValue)
+                  layer.copy(keyframes = layer.keyframes + (prop to list))
+              } else layer
+          }
+
+fun Composition.deleteKeyframe(
+              layerId: Long, prop: AnimatableProperty, index: Int
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = layer.keyframes[prop].orEmpty().toMutableList()
+              if (index in list.indices) {
+                  list.removeAt(index)
+                  layer.copy(keyframes = layer.keyframes + (prop to list))
+              } else layer
+          }
+
+fun Composition.updateKeyframeEasing(
+              layerId: Long, prop: AnimatableProperty, index: Int, easing: Easing
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = layer.keyframes[prop].orEmpty().toMutableList()
+              if (index in list.indices) {
+                  val h = easingHandles(easing)
+                  list[index] = list[index].copy(easing = easing, x1 = h[0], y1 = h[1], x2 = h[2], y2 = h[3])
+                  layer.copy(keyframes = layer.keyframes + (prop to list))
+              } else layer
+          }
+
+fun Composition.updateKeyframeHandles(
+              layerId: Long, prop: AnimatableProperty, index: Int,
+              x1: Float, y1: Float, x2: Float, y2: Float
+          ): Composition = mapLayer(layerId) { layer ->
+              val list = layer.keyframes[prop].orEmpty().toMutableList()
+              if (index in list.indices) {
+                  list[index] = list[index].copy(easing = Easing.CUSTOM, x1 = x1, y1 = y1, x2 = x2, y2 = y2)
+                  layer.copy(keyframes = layer.keyframes + (prop to list))
+              } else layer
+          }
+
+fun Composition.setLayerInPoint(layerId: Long, newIn: Float): Composition =
+              mapLayer(layerId) { l ->
+                  val out = l.startTime + l.duration
+                  val clamped = newIn.coerceIn(0f, out - 0.1f)
+                  l.copy(startTime = clamped, duration = out - clamped)
+              }
+
+fun Composition.setLayerOutPoint(layerId: Long, newOut: Float): Composition =
+              mapLayer(layerId) { l ->
+                  val clamped = newOut.coerceAtLeast(l.startTime + 0.1f)
+                  l.copy(duration = clamped - l.startTime)
+              }
+
+fun Composition.defaultValue(layer: Layer, prop: AnimatableProperty): Float = when (prop) {
+              AnimatableProperty.POSITION_X -> width / 2f
+              AnimatableProperty.POSITION_Y -> height / 2f
+              AnimatableProperty.SCALE -> 1f
+              AnimatableProperty.ROTATION -> 0f
+              AnimatableProperty.OPACITY -> 1f
+          }
+
+fun keyframeIndexAt(kfs: List<Keyframe>?, localTime: Float, eps: Float): Int? =
+              kfs?.withIndex()?.firstOrNull { abs(it.value.time - localTime) <= eps }?.index
+
+fun Composition.currentValue(layer: Layer, prop: AnimatableProperty, time: Float): Float {
+              val local = (time - layer.startTime).coerceIn(0f, layer.duration)
+              return KeyframeEngine.value(layer, prop, local, defaultValue(layer, prop))
+          }
+
+fun Composition.addKeyframeAtPlayhead(
+              layerId: Long, prop: AnimatableProperty, time: Float
+          ): Composition {
+              val layer = layers.first { it.id == layerId }
+              val local = (time - layer.startTime).coerceIn(0f, layer.duration)
+              val v = KeyframeEngine.value(layer, prop, local, defaultValue(layer, prop))
+              return addKeyframe(layerId, prop, local, v)
+          }
+
+fun Composition.setAnimatedValue(
+              layerId: Long, prop: AnimatableProperty, time: Float, value: Float
+          ): Composition {
+              val layer = layers.first { it.id == layerId }
+              val local = (time - layer.startTime).coerceIn(0f, layer.duration)
+              val idx = keyframeIndexAt(layer.keyframes[prop], local, 0.5f / fps)
+              return if (idx != null) updateKeyframeValue(layerId, prop, idx, value)
+              else addKeyframe(layerId, prop, local, value)
+          }
+
+fun Composition.toggleKeyframeAtPlayhead(
+              layerId: Long, prop: AnimatableProperty, time: Float
+          ): Composition {
+              val layer = layers.first { it.id == layerId }
+              val local = (time - layer.startTime).coerceIn(0f, layer.duration)
+              val idx = keyframeIndexAt(layer.keyframes[prop], local, 0.5f / fps)
+              return if (idx != null) deleteKeyframe(layerId, prop, idx)
+              else addKeyframeAtPlayhead(layerId, prop, time)
+          }
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/ui/Viewer.kt <<'EOF'
+          package com.aryan.motionfx.ui
+
+import androidx.compose.foundation.Canvas
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.drawscope.scale
+          import androidx.compose.ui.graphics.drawscope.translate
+          import androidx.compose.ui.graphics.drawscope.withTransform
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.drawText
+          import androidx.compose.ui.text.rememberTextMeasurer
+          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.unit.IntSize
+          import androidx.compose.ui.unit.sp
+          import com.aryan.motionfx.core.AnimatableProperty
+          import com.aryan.motionfx.core.Composition
+          import com.aryan.motionfx.core.ImageStore
+          import com.aryan.motionfx.core.KeyframeEngine
+          import com.aryan.motionfx.core.LayerType
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+@Composable
+          fun Viewer(comp: Composition, time: Float, modifier: Modifier = Modifier) {
+              val textMeasurer = rememberTextMeasurer()
+              Canvas(modifier) {
+                  val viewScale = min(size.width / comp.width, size.height / comp.height)
+                  val offX = (size.width - comp.width * viewScale) / 2f
+                  val offY = (size.height - comp.height * viewScale) / 2f
+
+translate(offX, offY) {
+                      scale(viewScale, viewScale) {
+                          drawRect(comp.backgroundColor, size = Size(comp.width.toFloat(), comp.height.toFloat()))
+                          comp.layers.asReversed().forEach { layer ->
+                              if (!layer.visible) return@forEach
+                              val local = time - layer.startTime
+                              if (local !in 0f..layer.duration) return@forEach
+
+val cx = KeyframeEngine.value(layer, AnimatableProperty.POSITION_X, local, comp.width / 2f)
+                              val cy = KeyframeEngine.value(layer, AnimatableProperty.POSITION_Y, local, comp.height / 2f)
+                              val s = KeyframeEngine.value(layer, AnimatableProperty.SCALE, local, 1f)
+                              val rot = KeyframeEngine.value(layer, AnimatableProperty.ROTATION, local, 0f)
+                              val alpha = KeyframeEngine.value(layer, AnimatableProperty.OPACITY, local, 1f)
+
+withTransform({
+                                  translate(cx, cy)
+                                  rotate(rot, pivot = Offset.Zero)
+                                  scale(s, s, pivot = Offset.Zero)
+                              }) {
+                                  val topLeft = Offset(-layer.size.width / 2f, -layer.size.height / 2f)
+                                  when (layer.type) {
+                                      LayerType.SOLID ->
+                                          drawRect(layer.color.copy(alpha = alpha), topLeft = topLeft, size = layer.size)
+                                      LayerType.TEXT ->
+                                          drawText(
+                                              textMeasurer, layer.text, topLeft = topLeft,
+                                              style = TextStyle(color = layer.color.copy(alpha = alpha), fontSize = layer.fontSize.sp)
+                                          )
+                                      LayerType.IMAGE -> {
+                                          ImageStore[layer.imageId]?.let { bmp ->
+                                              drawImage(
+                                                  image = bmp,
+                                                  srcOffset = IntOffset.Zero,
+                                                  srcSize = IntSize(bmp.width, bmp.height),
+                                                  dstOffset = IntOffset(topLeft.x.roundToInt(), topLeft.y.roundToInt()),
+                                                  dstSize = IntSize(
+                                                      layer.size.width.roundToInt().coerceAtLeast(1),
+                                                      layer.size.height.roundToInt().coerceAtLeast(1)
+                                                  ),
+                                                  alpha = alpha
+                                              )
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/ui/Timeline.kt <<'EOF'
+          package com.aryan.motionfx.ui
+
+import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gesture.detectDragGestures
+          import androidx.compose.foundation.gesture.detectHorizontalDragGestures
+          import androidx.compose.foundation.gesture.detectTapGestures
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.drawscope.DrawScope
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.aryan.motionfx.core.AnimatableProperty
+          import com.aryan.motionfx.core.Composition
+          import com.aryan.motionfx.core.Layer
+          import com.aryan.motionfx.core.propertyColor
+          import kotlin.math.abs
+
+private enum class DragZone { NONE, KEYFRAME, IN_POINT, OUT_POINT }
+
+@Composable
+          fun Timeline(
+              comp: Composition,
+              time: Float,
+              selectedLayerId: Long?,
+              onSelectLayer: (Long) -> Unit,
+              onSeek: (Float) -> Unit,
+              onMoveKeyframe: (Long, AnimatableProperty, Int, Float) -> Unit,
+              onDeleteKeyframe: (Long, AnimatableProperty, Int) -> Unit,
+              onSetInPoint: (Long, Float) -> Unit,
+              onSetOutPoint: (Long, Float) -> Unit,
+              modifier: Modifier = Modifier
+          ) {
+              val hScroll = rememberScrollState()
+              val vScroll = rememberScrollState()
+              val pxPerSec = 72.dp
+              val trackWidth = pxPerSec * comp.duration
+              val rowHeight = 30.dp
+
+Column(modifier) {
+                  Row(Modifier.fillMaxWidth().height(30.dp)) {
+                      Text("", Modifier.width(100.dp))
+                      Box(Modifier.weight(1f).fillMaxHeight().horizontalScroll(hScroll)) {
+                          Canvas(
+                              Modifier.width(trackWidth).fillMaxHeight()
+                                  .pointerInput(comp.duration) {
+                                      detectTapGestures { offset ->
+                                          onSeek((offset.x / pxPerSec.toPx()).coerceIn(0f, comp.duration))
+                                      }
+                                  }
+                                  .pointerInput(comp.duration) {
+                                      detectHorizontalDragGestures { change, _ ->
+                                          change.consume()
+                                          onSeek((change.position.x / pxPerSec.toPx()).coerceIn(0f, comp.duration))
+                                      }
+                                  }
+                          ) {
+                              val pps = pxPerSec.toPx()
+                              for (s in 0..comp.duration.toInt()) {
+                                  val x = s * pps
+                                  drawLine(Color(0xFF565B66), Offset(x, size.height * 0.55f), Offset(x, size.height), strokeWidth = 2f)
+                              }
+                              for (h in 1 until (comp.duration * 2).toInt()) {
+                                  val x = h * pps / 2f
+                                  drawLine(Color(0xFF3A3F4B), Offset(x, size.height * 0.75f), Offset(x, size.height), strokeWidth = 1f)
+                              }
+                              val px = time * pps
+                              drawLine(Color(0xFFE53935), Offset(px, 0f), Offset(px, size.height), strokeWidth = 2.5f)
+                          }
+                      }
+                  }
+
+Column(Modifier.fillMaxSize().verticalScroll(vScroll)) {
+                      comp.layers.forEach { layer ->
+                          Row(Modifier.fillMaxWidth().height(rowHeight)) {
+                              val selected = layer.id == selectedLayerId
+                              Text(
+                                  layer.name,
+                                  Modifier
+                                      .width(100.dp)
+                                      .fillMaxHeight()
+                                      .background(if (selected) Color(0xFF2E6FA3) else Color(0xFF23262E))
+                                      .clickable { onSelectLayer(layer.id) }
+                                      .padding(6.dp, 7.dp),
+                                  color = Color.White, fontSize = 11.sp, maxLines = 1
+                              )
+                              Box(Modifier.weight(1f).fillMaxHeight().horizontalScroll(hScroll)) {
+                                  LayerTrack(
+                                      layer = layer,
+                                      selected = selected,
+                                      compDuration = comp.duration,
+                                      trackWidth = trackWidth,
+                                      pxPerSec = pxPerSec,
+                                      onMoveKeyframe = onMoveKeyframe,
+                                      onDeleteKeyframe = onDeleteKeyframe,
+                                      onSetInPoint = onSetInPoint,
+                                      onSetOutPoint = onSetOutPoint
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+@Composable
+          private fun LayerTrack(
+              layer: Layer,
+              selected: Boolean,
+              compDuration: Float,
+              trackWidth: Dp,
+              pxPerSec: Dp,
+              onMoveKeyframe: (Long, AnimatableProperty, Int, Float) -> Unit,
+              onDeleteKeyframe: (Long, AnimatableProperty, Int) -> Unit,
+              onSetInPoint: (Long, Float) -> Unit,
+              onSetOutPoint: (Long, Float) -> Unit
+          ) {
+              val curLayer by rememberUpdatedState(layer)
+              var zone by remember { mutableStateOf(DragZone.NONE) }
+              var dragProp by remember { mutableStateOf(AnimatableProperty.POSITION_X) }
+              var dragIndex by remember { mutableStateOf(0) }
+
+Canvas(
+                  Modifier
+                      .width(trackWidth)
+                      .fillMaxHeight()
+                      .pointerInput(layer.id) {
+                          detectTapGestures(onLongPress = { pos ->
+                              val l = curLayer
+                              val pps = pxPerSec.toPx()
+                              val hit = l.keyframes.entries
+                                  .flatMap { (p, kfs) -> kfs.mapIndexed { i, kf -> Triple(p, i, (l.startTime + kf.time) * pps) } }
+                                  .minByOrNull { abs(it.third - pos.x) }
+                              if (hit != null && abs(hit.third - pos.x) < 14.dp.toPx()) {
+                                  onDeleteKeyframe(l.id, hit.first, hit.second)
+                              }
+                          })
+                      }
+                      .pointerInput(layer.id) {
+                          detectDragGestures(
+                              onDragStart = { pos ->
+                                  val l = curLayer
+                                  val pps = pxPerSec.toPx()
+                                  val kfHit = l.keyframes.entries
+                                      .flatMap { (p, kfs) -> kfs.mapIndexed { i, kf -> Triple(p, i, (l.startTime + kf.time) * pps) } }
+                                      .minByOrNull { abs(it.third - pos.x) }
+                                  when {
+                                      kfHit != null && abs(kfHit.third - pos.x) < 14.dp.toPx() -> {
+                                          zone = DragZone.KEYFRAME; dragProp = kfHit.first; dragIndex = kfHit.second
+                                      }
+                                      abs(pos.x - l.startTime * pps) < 12.dp.toPx() -> zone = DragZone.IN_POINT
+                                      abs(pos.x - (l.startTime + l.duration) * pps) < 12.dp.toPx() -> zone = DragZone.OUT_POINT
+                                      else -> zone = DragZone.NONE
+                                  }
+                              },
+                              onDrag = { change, _ ->
+                                  change.consume()
+                                  val l = curLayer
+                                  val pps = pxPerSec.toPx()
+                                  val t = (change.position.x / pps).coerceIn(0f, compDuration)
+                                  when (zone) {
+                                      DragZone.KEYFRAME -> onMoveKeyframe(
+                                          l.id, dragProp, dragIndex, (t - l.startTime).coerceIn(0f, l.duration)
+                                      )
+                                      DragZone.IN_POINT -> onSetInPoint(l.id, t.coerceAtMost(l.startTime + l.duration - 0.1f))
+                                      DragZone.OUT_POINT -> onSetOutPoint(l.id, t.coerceAtLeast(l.startTime + 0.1f))
+                                      DragZone.NONE -> Unit
+                                  }
+                              },
+                              onDragEnd = { zone = DragZone.NONE },
+                              onDragCancel = { zone = DragZone.NONE }
+                          )
+                      }
+              ) {
+                  val l = layer
+                  val pps = pxPerSec.toPx()
+                  val barTop = 5.dp.toPx()
+                  val barH = size.height - 10.dp.toPx()
+
+drawRoundRect(
+                      color = if (selected) Color(0xFF2E6FA3) else Color(0xFF3A3F4B),
+                      topLeft = Offset(l.startTime * pps, barTop),
+                      size = Size(l.duration * pps, barH),
+                      cornerRadius = CornerRadius(6f)
+                  )
+                  val handleW = 5.dp.toPx()
+                  val handleColor = Color(0xFF8FA3B8)
+                  drawRoundRect(handleColor, Offset(l.startTime * pps, barTop - 2.dp.toPx()), Size(handleW, barH + 4.dp.toPx()), CornerRadius(3f))
+                  drawRoundRect(handleColor, Offset((l.startTime + l.duration) * pps - handleW, barTop - 2.dp.toPx()), Size(handleW, barH + 4.dp.toPx()), CornerRadius(3f))
+                  l.keyframes.forEach { (prop, kfs) ->
+                      val c = propertyColor(prop)
+                      kfs.forEach { kf -> drawDiamond((l.startTime + kf.time) * pps, size.height / 2f, 5.dp.toPx(), c) }
+                  }
+              }
+          }
+
+private fun DrawScope.drawDiamond(cx: Float, cy: Float, r: Float, color: Color) {
+              drawPath(
+                  Path().apply {
+                      moveTo(cx, cy - r); lineTo(cx + r, cy); lineTo(cx, cy + r); lineTo(cx - r, cy); close()
+                  },
+                  color
+              )
+          }
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/ui/LayerPanel.kt <<'EOF'
+          package com.aryan.motionfx.ui
+
+import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Visibility
+          import androidx.compose.material.icons.filled.VisibilityOff
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.aryan.motionfx.core.AnimatableProperty
+          import com.aryan.motionfx.core.Composition
+          import com.aryan.motionfx.core.LayerType
+          import com.aryan.motionfx.core.propertyColor
+
+@Composable
+          fun LayerPanel(
+              comp: Composition,
+              time: Float,
+              selectedLayerId: Long?,
+              onSelectLayer: (Long) -> Unit,
+              onToggleVisibility: (Long) -> Unit,
+              onAddKeyframe: (Long, AnimatableProperty) -> Unit,
+              modifier: Modifier = Modifier
+          ) {
+              Column(modifier.verticalScroll(rememberScrollState())) {
+                  Text("Layers", Modifier.padding(8.dp, 6.dp), color = Color(0xFF9AA0A6), fontSize = 12.sp)
+
+comp.layers.asReversed().forEach { layer ->
+                      Row(
+                          Modifier.fillMaxWidth()
+                              .background(if (layer.id == selectedLayerId) Color(0xFF2E6FA3) else Color.Transparent)
+                              .clickable { onSelectLayer(layer.id) }
+                              .padding(horizontal = 4.dp, vertical = 2.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Icon(
+                              if (layer.visible) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                              contentDescription = "visibility",
+                              modifier = Modifier.size(16.dp).clickable { onToggleVisibility(layer.id) },
+                              tint = Color(0xFFC9CED6)
+                          )
+                          Spacer(Modifier.width(4.dp))
+                          Text(layer.name, color = Color.White, fontSize = 11.sp, maxLines = 1)
+                          Spacer(Modifier.weight(1f))
+                          Text(
+                              when (layer.type) {
+                                  LayerType.TEXT -> "T"
+                                  LayerType.IMAGE -> "I"
+                                  LayerType.SOLID -> "S"
+                              },
+                              color = layer.color, fontSize = 11.sp
+                          )
+                      }
+                  }
+
+val sel = comp.layers.firstOrNull { it.id == selectedLayerId }
+                  if (sel != null) {
+                      Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF3A3F4B)))
+                      Text(
+                          "Add keyframe @ playhead",
+                          Modifier.padding(8.dp, 6.dp), color = Color(0xFF9AA0A6), fontSize = 10.sp
+                      )
+                      listOf(
+                          AnimatableProperty.POSITION_X to "Position X",
+                          AnimatableProperty.POSITION_Y to "Position Y",
+                          AnimatableProperty.SCALE to "Scale",
+                          AnimatableProperty.ROTATION to "Rotation",
+                          AnimatableProperty.OPACITY to "Opacity"
+                      ).forEach { (prop, label) ->
+                          TextButton(
+                              onClick = { onAddKeyframe(sel.id, prop) },
+                              modifier = Modifier.fillMaxWidth().height(28.dp),
+                              contentPadding = PaddingValues(horizontal = 10.dp)
+                          ) {
+                              Box(Modifier.size(8.dp).background(propertyColor(prop)))
+                              Spacer(Modifier.width(6.dp))
+                              Text(label, fontSize = 11.sp, color = Color.White)
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+cat > app/src/main/java/com/aryan/motionfx/ui/Inspector.kt <<'EOF'
+          package com.aryan.motionfx.ui
+
+import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gesture.detectDragGestures
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
